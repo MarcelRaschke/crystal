@@ -1,13 +1,6 @@
 require "./event_libevent"
 
 # :nodoc:
-abstract class Crystal::EventLoop
-  def self.create
-    Crystal::LibEvent::EventLoop.new
-  end
-end
-
-# :nodoc:
 class Crystal::LibEvent::EventLoop < Crystal::EventLoop
   private getter(event_base) { Crystal::LibEvent::Event::Base.new }
 
@@ -76,6 +69,30 @@ class Crystal::LibEvent::EventLoop < Crystal::EventLoop
     end
   end
 
+  def read(file_descriptor : Crystal::System::FileDescriptor, slice : Bytes) : Int32
+    file_descriptor.evented_read("Error reading file_descriptor") do
+      LibC.read(file_descriptor.fd, slice, slice.size).tap do |return_code|
+        if return_code == -1 && Errno.value == Errno::EBADF
+          raise IO::Error.new "File not open for reading", target: file_descriptor
+        end
+      end
+    end
+  end
+
+  def write(file_descriptor : Crystal::System::FileDescriptor, slice : Bytes) : Int32
+    file_descriptor.evented_write("Error writing file_descriptor") do
+      LibC.write(file_descriptor.fd, slice, slice.size).tap do |return_code|
+        if return_code == -1 && Errno.value == Errno::EBADF
+          raise IO::Error.new "File not open for writing", target: file_descriptor
+        end
+      end
+    end
+  end
+
+  def close(file_descriptor : Crystal::System::FileDescriptor) : Nil
+    file_descriptor.evented_close
+  end
+
   def read(socket : ::Socket, slice : Bytes) : Int32
     socket.evented_read("Error reading socket") do
       LibC.recv(socket.fd, slice, slice.size, 0).to_i32
@@ -131,7 +148,23 @@ class Crystal::LibEvent::EventLoop < Crystal::EventLoop
 
   def accept(socket : ::Socket) : ::Socket::Handle?
     loop do
-      client_fd = LibC.accept(socket.fd, nil, nil)
+      client_fd =
+        {% if LibC.has_method?(:accept4) %}
+          LibC.accept4(socket.fd, nil, nil, LibC::SOCK_CLOEXEC)
+        {% else %}
+          # we may fail to set FD_CLOEXEC between `accept` and `fcntl` but we
+          # can't call `Crystal::System::Socket.lock_read` because the socket
+          # might be in blocking mode and accept would block until the socket
+          # receives a connection.
+          #
+          # we could lock when `socket.blocking?` is false, but another thread
+          # could change the socket back to blocking mode between the condition
+          # check and the `accept` call.
+          fd = LibC.accept(socket.fd, nil, nil)
+          Crystal::System::Socket.fcntl(fd, LibC::F_SETFD, LibC::FD_CLOEXEC) unless fd == -1
+          fd
+        {% end %}
+
       if client_fd == -1
         if socket.closed?
           return
